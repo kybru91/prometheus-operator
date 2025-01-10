@@ -17,7 +17,6 @@ package operator
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,7 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 
-	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
+	"github.com/prometheus-operator/prometheus-operator/internal/util"
 	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
 )
 
@@ -42,27 +41,8 @@ type ShardedSecret struct {
 	secretShards []*v1.Secret
 }
 
-// NewShardedSecret takes a v1.Secret object as template and returns a new ShardedSecret.
-// The template's name will be used as the prefix for the concrete secrets.
-func NewShardedSecret(template *v1.Secret) *ShardedSecret {
-	return &ShardedSecret{
-		template: template,
-		data:     make(map[string][]byte),
-	}
-}
-
-type Byter interface {
-	Bytes() []byte
-}
-
-// Append adds a new key + data pair.
-// If the key already exists, data gets overwritten.
-func (s *ShardedSecret) Append(k fmt.Stringer, v Byter) {
-	s.data[k.String()] = v.Bytes()
-}
-
-// UpdateSecrets updates the concrete Secrets from the stored data.
-func (s *ShardedSecret) UpdateSecrets(ctx context.Context, sClient corev1.SecretInterface) error {
+// updateSecrets updates the concrete Secrets from the stored data.
+func (s *ShardedSecret) updateSecrets(ctx context.Context, sClient corev1.SecretInterface) error {
 	secrets := s.shard()
 
 	for _, secret := range secrets {
@@ -79,18 +59,11 @@ func (s *ShardedSecret) UpdateSecrets(ctx context.Context, sClient corev1.Secret
 func (s *ShardedSecret) shard() []*v1.Secret {
 	s.secretShards = []*v1.Secret{}
 
-	// Ensure that we always iterate over the keys in the same order.
-	keys := make([]string, 0, len(s.data))
-	for k := range s.data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
 	currentIndex := 0
 	secretSize := 0
 	currentSecret := s.newSecretAt(currentIndex)
 
-	for _, key := range keys {
+	for _, key := range util.SortedKeys(s.data) {
 		v := s.data[key]
 		vSize := len(key) + len(v)
 		if secretSize+vSize > MaxSecretDataSizeBytes {
@@ -141,25 +114,42 @@ func (s *ShardedSecret) secretNameAt(index int) string {
 	return fmt.Sprintf("%s-%d", s.template.Name, index)
 }
 
-// SecretNames returns the names of the concrete secrets.
-// It must be called after UpdateSecrets().
-func (s *ShardedSecret) SecretNames() []string {
-	var names []string
-	for i := 0; i < len(s.secretShards); i++ {
-		names = append(names, s.secretNameAt(i))
-	}
-
-	return names
+// Hash implements the Hashable interface from github.com/mitchellh/hashstructure.
+func (s *ShardedSecret) Hash() (uint64, error) {
+	return uint64(len(s.secretShards)), nil
 }
 
-func ReconcileShardedSecretForTLSAssets(ctx context.Context, store *assets.Store, client kubernetes.Interface, template *v1.Secret) (*ShardedSecret, error) {
-	shardedSecret := NewShardedSecret(template)
-
-	for k, v := range store.TLSAssets {
-		shardedSecret.Append(k, v)
+// Volume returns a v1.Volume object with all TLS assets ready to be mounted in a container.
+// It must be called after UpdateSecrets().
+func (s *ShardedSecret) Volume(name string) v1.Volume {
+	volume := v1.Volume{
+		Name: name,
+		VolumeSource: v1.VolumeSource{
+			Projected: &v1.ProjectedVolumeSource{
+				Sources: []v1.VolumeProjection{},
+			},
+		},
 	}
 
-	if err := shardedSecret.UpdateSecrets(ctx, client.CoreV1().Secrets(template.Namespace)); err != nil {
+	for i := 0; i < len(s.secretShards); i++ {
+		volume.Projected.Sources = append(volume.Projected.Sources,
+			v1.VolumeProjection{
+				Secret: &v1.SecretProjection{
+					LocalObjectReference: v1.LocalObjectReference{Name: s.secretNameAt(i)},
+				},
+			})
+	}
+
+	return volume
+}
+
+func ReconcileShardedSecret(ctx context.Context, data map[string][]byte, client kubernetes.Interface, template *v1.Secret) (*ShardedSecret, error) {
+	shardedSecret := &ShardedSecret{
+		template: template,
+		data:     data,
+	}
+
+	if err := shardedSecret.updateSecrets(ctx, client.CoreV1().Secrets(template.Namespace)); err != nil {
 		return nil, fmt.Errorf("failed to update the TLS secrets: %w", err)
 	}
 

@@ -9,6 +9,11 @@ linters:
   - godot
   - testifylint
   - unconvert
+  - recvcheck
+  - iface
+  - exptostd
+  - nilnesserr
+  - sloglint
 
 issues:
   exclude-rules:
@@ -16,14 +21,19 @@ issues:
   - path: _test.go
     linters:
     - errcheck
-  # TODO: fix linter errors before enabling it for the framework
-  - path: test/framework
-    linters:
+  # We *frequently* use the term 'new' in the context of properties
+  # (new and old properties),
+  # and we rarely use the 'new' built-in function.
+  # It's fine to ignore these cases.
+  - linters:
     - revive
+    text: 'redefines-builtin-id: redefinition of the built-in function new'
 
 linters-settings:
   errcheck:
-    exclude: scripts/errcheck_excludes.txt
+    exclude-functions:
+      # Any error in HTTP handlers is handled by the server itself.
+      - (net/http.ResponseWriter).Write
   gci:
     sections:
       - standard

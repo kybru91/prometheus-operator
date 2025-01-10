@@ -27,6 +27,20 @@ This document tracks people and use cases for the Prometheus Operator in product
 
 Go ahead and [add your organization](https://github.com/prometheus-operator/prometheus-operator/edit/main/ADOPTERS.md) to the list.
 
+## AuthZed
+
+[authzed.com](https://authzed.com)
+
+Environments: AWS, Azure, Google Cloud
+
+Uses [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus): Yes
+
+Details (optional):
+- Every environment (internal and customer) leverages the Prometheus Operator for deploying metrics.
+  Kube Prometheus is used for cluster metrics, that are managed by an HA Prometheus Stateful Set that
+  runs the Thanos sidecar. Thanos is used to aggregate and query across multi-region/cluster environments.
+  Alertmanager is used to page on-call SREs.
+
 ## CERN
 
 [European Laboratory for Particle Physics](https://home.cern/)
@@ -70,6 +84,19 @@ Details:
 - Loose coupling between Kubernetes cluster administrators who manage alerting sinks and service owners who define alerts for their services
 - 800K samples/s
 - 30M active series
+
+## DACHS IT
+
+[dachs-it.de](https://dachs-it.de)
+
+Environments: AWS, Azure, Bare Metal
+
+Uses [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus): No
+
+Details (optional):
+- HA Pair of Prometheus
+- 25k samples/s
+- 750k active series
 
 ## Deckhouse
 
@@ -120,6 +147,19 @@ Details:
 - One prometheus instance per cluster (8 so far)
 - 20000 samples/s
 - 1M active series
+
+## iFlytek
+
+https://www.iflytek.com/
+
+Environments: iflytek Cloud, etc
+
+Uses [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus): Yes
+
+Details (optional):
+- One prometheus operator per management cluster and one prometheus instance per workload cluster
+- 700000 samples/s
+- 30M active series
 
 ## Innovaccer
 
@@ -309,6 +349,20 @@ Details (optional):
 - A huge fleet of OpenShift and Kubernetes clusters, each using Prometheus Operator
 - All managed by [Project Syn](https://syn.tools/), leveraging Commodore Components like [component-rancher-monitoring](https://github.com/projectsyn/component-rancher-monitoring) which re-uses Prometheus Operator
 
+## WarpBuild
+
+[warpbuild.com](https://warpbuild.com)
+
+Environments: AWS, Google Cloud
+
+Uses [kube-prometheus](https://github.com/prometheus-operator/kube-prometheus): Yes
+
+Details (optional):
+- Prometheus Operator provides real-time monitoring of all our runners. With AlertManager, we promptly receive notifications regarding any cluster issues, allowing for swift resolution before they have the chance to escalate into outages. Grafana allows us to quickly visualize our cluster's health and performance metrics.
+- ~6k samples/s
+- ~500k active series
+
+  
 ## Wise
 
 [wise.com](https://wise.com)
@@ -322,6 +376,7 @@ Details (optional):
 - Operator also helps us seamlessly manage anywhere between 600-1500 short-lived prometheus instances for our "integration" kubernetes cluster.
 - ~15mn samples/s
 - ~200mn active series
+
 
 ## <Insert Company/Organization Name>
 

@@ -37,9 +37,8 @@ import (
 func SourceToIOReader(source string) (io.Reader, error) {
 	if strings.HasPrefix(source, "http") {
 		return URLToIOReader(source)
-	} else {
-		return PathToOSFile(source)
 	}
+	return PathToOSFile(source)
 }
 
 func PathToOSFile(relativePath string) (*os.File, error) {
@@ -60,7 +59,7 @@ func URLToIOReader(url string) (io.Reader, error) {
 	var resp *http.Response
 	timeout := 30 * time.Second
 
-	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(_ context.Context) (bool, error) {
 		var err error
 		resp, err = http.Get(url)
 		if err == nil && resp.StatusCode == 200 {
@@ -132,7 +131,7 @@ func (f *Framework) WaitForPodsRunImage(ctx context.Context, namespace string, e
 
 func WaitForHTTPSuccessStatusCode(timeout time.Duration, url string) error {
 	var resp *http.Response
-	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(ctx context.Context) (bool, error) {
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, timeout, false, func(_ context.Context) (bool, error) {
 		var err error
 		resp, err = http.Get(url)
 		if err == nil && resp.StatusCode == 200 {
@@ -160,20 +159,6 @@ func podRunsImage(p v1.Pod, image string) bool {
 	}
 
 	return false
-}
-
-func (f *Framework) GetLogs(ctx context.Context, namespace string, podName, containerName string) (string, error) {
-	logs, err := f.KubeClient.CoreV1().RESTClient().Get().
-		Resource("pods").
-		Namespace(namespace).
-		Name(podName).SubResource("log").
-		Param("container", containerName).
-		Do(ctx).
-		Raw()
-	if err != nil {
-		return "", err
-	}
-	return string(logs), err
 }
 
 // ProxyGetPod expects resourceName as "[protocol:]podName[:portNameOrNumber]".
@@ -231,7 +216,7 @@ func (f *Framework) GetMetricVal(ctx context.Context, protocol, ns, podName, por
 		return 0, err
 	}
 
-	parser := textparse.NewPromParser(resp)
+	parser := textparse.NewPromParser(resp, labels.NewSymbolTable())
 	for {
 		entry, err := parser.Next()
 		if err != nil {

@@ -37,7 +37,8 @@ import (
 func (f *Framework) MakeBasicThanosRuler(name string, replicas int32, queryEndpoint string) *monitoringv1.ThanosRuler {
 	return &monitoringv1.ThanosRuler{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:        name,
+			Annotations: map[string]string{},
 		},
 		Spec: monitoringv1.ThanosRulerSpec{
 			Replicas:       &replicas,
@@ -51,11 +52,11 @@ func (f *Framework) MakeBasicThanosRuler(name string, replicas int32, queryEndpo
 func (f *Framework) CreateThanosRulerAndWaitUntilReady(ctx context.Context, ns string, tr *monitoringv1.ThanosRuler) (*monitoringv1.ThanosRuler, error) {
 	result, err := f.MonClientV1.ThanosRulers(ns).Create(ctx, tr, metav1.CreateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("creating %v ThanosRuler instances failed (%v): %v", tr.Spec.Replicas, tr.Name, err)
+		return nil, fmt.Errorf("creating %d ThanosRuler instances failed (%v): %v", ptr.Deref(tr.Spec.Replicas, 1), tr.Name, err)
 	}
 
 	if err := f.WaitForThanosRulerReady(ctx, ns, result, 5*time.Minute); err != nil {
-		return nil, fmt.Errorf("waiting for %v Prometheus instances timed out (%v): %v", tr.Spec.Replicas, tr.Name, err)
+		return nil, fmt.Errorf("waiting for %d ThanosRuler instances timed out (%v): %v", ptr.Deref(tr.Spec.Replicas, 1), tr.Name, err)
 	}
 
 	return result, nil

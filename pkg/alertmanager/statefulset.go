@@ -16,13 +16,12 @@ package alertmanager
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/blang/semver/v4"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -59,8 +58,6 @@ const (
 	alertmanagerConfigEnvsubstFilename = "alertmanager.env.yaml"
 
 	alertmanagerStorageDir = "/alertmanager"
-
-	sSetInputHashName = "prometheus-operator-input-hash"
 )
 
 var (
@@ -68,7 +65,7 @@ var (
 	probeTimeoutSeconds int32 = 3
 )
 
-func makeStatefulSet(logger log.Logger, am *monitoringv1.Alertmanager, config Config, inputHash string, tlsAssetSecrets []string) (*appsv1.StatefulSet, error) {
+func makeStatefulSet(logger *slog.Logger, am *monitoringv1.Alertmanager, config Config, inputHash string, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSet, error) {
 	// TODO(fabxc): is this the right point to inject defaults?
 	// Ideally we would do it before storing but that's currently not possible.
 	// Potentially an update handler on first insertion.
@@ -94,65 +91,55 @@ func makeStatefulSet(logger log.Logger, am *monitoringv1.Alertmanager, config Co
 		am.Spec.Resources.Requests[v1.ResourceMemory] = resource.MustParse("200Mi")
 	}
 
-	spec, err := makeStatefulSetSpec(logger, am, config, tlsAssetSecrets)
+	spec, err := makeStatefulSetSpec(logger, am, config, tlsSecrets)
 	if err != nil {
 		return nil, err
 	}
 
-	annotations := map[string]string{
-		sSetInputHashName: inputHash,
-	}
-
-	// do not transfer kubectl annotations to the statefulset so it is not
-	// pruned by kubectl
-	for key, value := range am.ObjectMeta.Annotations {
-		if key != sSetInputHashName && !strings.HasPrefix(key, "kubectl.kubernetes.io/") {
-			annotations[key] = value
-		}
-	}
-
-	statefulset := &appsv1.StatefulSet{
-		Spec: *spec,
-	}
+	statefulset := &appsv1.StatefulSet{Spec: *spec}
 	operator.UpdateObject(
 		statefulset,
 		operator.WithName(prefixedName(am.Name)),
-		operator.WithAnnotations(annotations),
+		operator.WithInputHashAnnotation(inputHash),
+		operator.WithAnnotations(am.GetAnnotations()),
 		operator.WithAnnotations(config.Annotations),
-		operator.WithLabels(am.Labels),
+		operator.WithLabels(am.GetLabels()),
 		operator.WithLabels(config.Labels),
 		operator.WithManagingOwner(am),
+		operator.WithoutKubectlAnnotations(),
 	)
 
-	if am.Spec.ImagePullSecrets != nil && len(am.Spec.ImagePullSecrets) > 0 {
+	if len(am.Spec.ImagePullSecrets) > 0 {
 		statefulset.Spec.Template.Spec.ImagePullSecrets = am.Spec.ImagePullSecrets
 	}
 
 	storageSpec := am.Spec.Storage
-	if storageSpec == nil {
+	switch {
+	case storageSpec == nil:
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(am.Name),
 			VolumeSource: v1.VolumeSource{
 				EmptyDir: &v1.EmptyDirVolumeSource{},
 			},
 		})
-	} else if storageSpec.EmptyDir != nil {
-		emptyDir := storageSpec.EmptyDir
+
+	case storageSpec.EmptyDir != nil:
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(am.Name),
 			VolumeSource: v1.VolumeSource{
-				EmptyDir: emptyDir,
+				EmptyDir: storageSpec.EmptyDir,
 			},
 		})
-	} else if storageSpec.Ephemeral != nil {
-		ephemeral := storageSpec.Ephemeral
+
+	case storageSpec.Ephemeral != nil:
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(am.Name),
 			VolumeSource: v1.VolumeSource{
-				Ephemeral: ephemeral,
+				Ephemeral: storageSpec.Ephemeral,
 			},
 		})
-	} else {
+
+	default: // storageSpec.VolumeClaimTemplate
 		pvcTemplate := operator.MakeVolumeClaimTemplate(storageSpec.VolumeClaimTemplate)
 		if pvcTemplate.Name == "" {
 			pvcTemplate.Name = volumeName(am.Name)
@@ -169,6 +156,10 @@ func makeStatefulSet(logger log.Logger, am *monitoringv1.Alertmanager, config Co
 
 	statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, am.Spec.Volumes...)
 
+	if am.Spec.PersistentVolumeClaimRetentionPolicy != nil {
+		statefulset.Spec.PersistentVolumeClaimRetentionPolicy = am.Spec.PersistentVolumeClaimRetentionPolicy
+	}
+
 	return statefulset, nil
 }
 
@@ -179,7 +170,8 @@ func makeStatefulSetService(a *monitoringv1.Alertmanager, config Config) *v1.Ser
 
 	svc := &v1.Service{
 		Spec: v1.ServiceSpec{
-			ClusterIP: "None",
+			ClusterIP:                "None",
+			PublishNotReadyAddresses: true,
 			Ports: []v1.ServicePort{
 				{
 					Name:       a.Spec.PortName,
@@ -218,10 +210,10 @@ func makeStatefulSetService(a *monitoringv1.Alertmanager, config Config) *v1.Ser
 	return svc
 }
 
-func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config Config, tlsAssetSecrets []string) (*appsv1.StatefulSetSpec, error) {
+func makeStatefulSetSpec(logger *slog.Logger, a *monitoringv1.Alertmanager, config Config, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSetSpec, error) {
 	amVersion := operator.StringValOrDefault(a.Spec.Version, operator.DefaultAlertmanagerVersion)
 	amImagePath, err := operator.BuildImagePath(
-		operator.StringPtrValOrDefault(a.Spec.Image, ""),
+		ptr.Deref(a.Spec.Image, ""),
 		operator.StringValOrDefault(a.Spec.BaseImage, config.AlertmanagerDefaultBaseImage),
 		amVersion,
 		operator.StringValOrDefault(a.Spec.Tag, ""),
@@ -256,6 +248,10 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 
 	if a.Spec.ExternalURL != "" {
 		amArgs = append(amArgs, "--web.external-url="+a.Spec.ExternalURL)
+	}
+
+	if version.GTE(semver.MustParse("0.27.0")) && len(a.Spec.EnableFeatures) > 0 {
+		amArgs = append(amArgs, fmt.Sprintf("--enable-feature=%v", strings.Join(a.Spec.EnableFeatures[:], ",")))
 	}
 
 	webRoutePrefix := "/"
@@ -359,12 +355,7 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 	// We should try to avoid removing such immutable fields whenever possible since doing
 	// so forces us to enter the 'recreate cycle' and can potentially lead to downtime.
 	// The requirement to make a change here should be carefully evaluated.
-	podSelectorLabels := map[string]string{
-		"app.kubernetes.io/name":       "alertmanager",
-		"app.kubernetes.io/managed-by": "prometheus-operator",
-		"app.kubernetes.io/instance":   a.Name,
-		"alertmanager":                 a.Name,
-	}
+	podSelectorLabels := makeSelectorLabels(a.GetObjectMeta().GetName())
 	if a.Spec.PodMetadata != nil {
 		for k, v := range a.Spec.PodMetadata.Labels {
 			podLabels[k] = v
@@ -418,61 +409,10 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		}, ports...)
 	}
 
-	// Adjust Alertmanager command line args to specified AM version
-	//
-	// Alertmanager versions < v0.15.0 are only supported on a best effort basis
-	// starting with Prometheus Operator v0.30.0.
-	switch version.Major {
-	case 0:
-		if version.Minor < 15 {
-			for i := range amArgs {
-				// below Alertmanager v0.15.0 peer address port specification is not necessary
-				if strings.Contains(amArgs[i], "--cluster.peer") {
-					amArgs[i] = strings.TrimSuffix(amArgs[i], ":9094")
-				}
-
-				// below Alertmanager v0.15.0 high availability flags are prefixed with 'mesh' instead of 'cluster'
-				amArgs[i] = strings.Replace(amArgs[i], "--cluster.", "--mesh.", 1)
-			}
-		} else {
-			// reconnect-timeout was added in 0.15 (https://github.com/prometheus/alertmanager/pull/1384)
-			// Override default 6h value to allow AlertManager cluster to
-			// quickly remove a cluster member after its pod restarted or during a
-			// regular rolling update.
-			amArgs = append(amArgs, "--cluster.reconnect-timeout=5m")
-		}
-		if version.Minor < 13 {
-			for i := range amArgs {
-				// below Alertmanager v0.13.0 all flags are with single dash.
-				amArgs[i] = strings.Replace(amArgs[i], "--", "-", 1)
-			}
-		}
-		if version.Minor < 7 {
-			// below Alertmanager v0.7.0 the flag 'web.route-prefix' does not exist
-			amArgs = filter(amArgs, func(s string) bool {
-				return !strings.Contains(s, "web.route-prefix")
-			})
-		}
-	default:
-		return nil, fmt.Errorf("unsupported Alertmanager major version %s", version)
-	}
-
-	assetsVolume := v1.Volume{
-		Name: tlsAssetsVolumeName,
-		VolumeSource: v1.VolumeSource{
-			Projected: &v1.ProjectedVolumeSource{
-				Sources: []v1.VolumeProjection{},
-			},
-		},
-	}
-	for _, assetShard := range tlsAssetSecrets {
-		assetsVolume.Projected.Sources = append(assetsVolume.Projected.Sources,
-			v1.VolumeProjection{
-				Secret: &v1.SecretProjection{
-					LocalObjectReference: v1.LocalObjectReference{Name: assetShard},
-				},
-			})
-	}
+	// Override default 6h value to allow AlertManager cluster to
+	// quickly remove a cluster member after its pod restarted or during a
+	// regular rolling update.
+	amArgs = append(amArgs, "--cluster.reconnect-timeout=5m")
 
 	volumes := []v1.Volume{
 		{
@@ -483,7 +423,7 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 				},
 			},
 		},
-		assetsVolume,
+		tlsSecrets.Volume(tlsAssetsVolumeName),
 		{
 			Name: alertmanagerConfigOutVolumeName,
 			VolumeSource: v1.VolumeSource{
@@ -524,6 +464,20 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		},
 	}
 
+	var configReloaderWebConfigFile string
+	watchedDirectories := []string{alertmanagerConfigDir}
+	configReloaderVolumeMounts := []v1.VolumeMount{
+		{
+			Name:      alertmanagerConfigVolumeName,
+			MountPath: alertmanagerConfigDir,
+			ReadOnly:  true,
+		},
+		{
+			Name:      alertmanagerConfigOutVolumeName,
+			MountPath: alertmanagerConfigOutDir,
+		},
+	}
+
 	amCfg := a.Spec.AlertmanagerConfiguration
 	if amCfg != nil && len(amCfg.Templates) > 0 {
 		sources := []v1.VolumeProjection{}
@@ -531,7 +485,7 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		for _, v := range amCfg.Templates {
 			if v.ConfigMap != nil {
 				if keys.Has(v.ConfigMap.Key) {
-					level.Debug(logger).Log("msg", fmt.Sprintf("skipping %q due to duplicate key %q", v.ConfigMap.Key, v.ConfigMap.Name))
+					logger.Debug(fmt.Sprintf("skipping %q due to duplicate key %q", v.ConfigMap.Key, v.ConfigMap.Name))
 					continue
 				}
 				sources = append(sources, v1.VolumeProjection{
@@ -549,7 +503,7 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 			}
 			if v.Secret != nil {
 				if keys.Has(v.Secret.Key) {
-					level.Debug(logger).Log("msg", fmt.Sprintf("skipping %q due to duplicate key %q", v.Secret.Key, v.Secret.Name))
+					logger.Debug(fmt.Sprintf("skipping %q due to duplicate key %q", v.Secret.Key, v.Secret.Name))
 					continue
 				}
 				sources = append(sources, v1.VolumeProjection{
@@ -579,20 +533,12 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 			ReadOnly:  true,
 			MountPath: alertmanagerTemplatesDir,
 		})
-	}
-
-	var configReloaderWebConfigFile string
-	watchedDirectories := []string{alertmanagerConfigDir}
-	configReloaderVolumeMounts := []v1.VolumeMount{
-		{
-			Name:      alertmanagerConfigVolumeName,
-			MountPath: alertmanagerConfigDir,
+		configReloaderVolumeMounts = append(configReloaderVolumeMounts, v1.VolumeMount{
+			Name:      alertmanagerTemplatesVolumeName,
 			ReadOnly:  true,
-		},
-		{
-			Name:      alertmanagerConfigOutVolumeName,
-			MountPath: alertmanagerConfigOutDir,
-		},
+			MountPath: alertmanagerTemplatesDir,
+		})
+		watchedDirectories = append(watchedDirectories, alertmanagerTemplatesDir)
 	}
 
 	rn := k8sutil.NewResourceNamerWithPrefix("secret")
@@ -674,12 +620,8 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		volumes = append(volumes, configVol...)
 		amVolumeMounts = append(amVolumeMounts, configMount...)
 
-		// To avoid breaking users deploying an old version of the config-reloader image.
-		// TODO: remove the if condition after v0.72.0.
-		if a.Spec.Web != nil {
-			configReloaderWebConfigFile = confArg.Value
-			configReloaderVolumeMounts = append(configReloaderVolumeMounts, configMount...)
-		}
+		configReloaderWebConfigFile = confArg.Value
+		configReloaderVolumeMounts = append(configReloaderVolumeMounts, configMount...)
 	}
 
 	finalSelectorLabels := config.Labels.Merge(podSelectorLabels)
@@ -757,7 +699,7 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		operator.CreateConfigReloader(
 			"init-config-reloader",
 			operator.ReloaderConfig(config.ReloaderConfig),
-			operator.ReloaderRunOnce(),
+			operator.InitContainer(),
 			operator.LogFormat(a.Spec.LogFormat),
 			operator.LogLevel(a.Spec.LogLevel),
 			operator.WatchedDirectories(watchedDirectories),
@@ -774,12 +716,12 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 		return nil, fmt.Errorf("failed to merge init containers spec: %w", err)
 	}
 
-	// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
-	// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
-	return &appsv1.StatefulSetSpec{
-		ServiceName:         governingServiceName,
-		Replicas:            a.Spec.Replicas,
-		MinReadySeconds:     minReadySeconds,
+	spec := appsv1.StatefulSetSpec{
+		ServiceName:     governingServiceName,
+		Replicas:        a.Spec.Replicas,
+		MinReadySeconds: minReadySeconds,
+		// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
+		// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
 		PodManagementPolicy: appsv1.ParallelPodManagement,
 		UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 			Type: appsv1.RollingUpdateStatefulSetStrategyType,
@@ -808,7 +750,11 @@ func makeStatefulSetSpec(logger log.Logger, a *monitoringv1.Alertmanager, config
 				HostAliases:                   operator.MakeHostAliases(a.Spec.HostAliases),
 			},
 		},
-	}, nil
+	}
+
+	k8sutil.UpdateDNSPolicy(&spec.Template.Spec, a.Spec.DNSPolicy)
+	k8sutil.UpdateDNSConfig(&spec.Template.Spec, a.Spec.DNSConfig)
+	return &spec, nil
 }
 
 func defaultConfigSecretName(am *monitoringv1.Alertmanager) string {
@@ -846,14 +792,4 @@ func subPathForStorage(s *monitoringv1.StorageSpec) string {
 	}
 
 	return "alertmanager-db"
-}
-
-func filter(strings []string, f func(string) bool) []string {
-	filteredStrings := make([]string, 0)
-	for _, s := range strings {
-		if f(s) {
-			filteredStrings = append(filteredStrings, s)
-		}
-	}
-	return filteredStrings
 }
