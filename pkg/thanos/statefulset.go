@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
-	"strings"
+	"path/filepath"
 
 	"github.com/blang/semver/v4"
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,25 +32,27 @@ import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/k8sutil"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
+	"github.com/prometheus-operator/prometheus-operator/pkg/webconfig"
 )
 
 const (
 	rulesDir                  = "/etc/thanos/rules"
 	configDir                 = "/etc/thanos/config"
 	storageDir                = "/thanos/data"
+	webConfigDir              = "/etc/thanos/web_config"
+	tlsAssetsDir              = "/etc/thanos/certs"
 	governingServiceName      = "thanos-ruler-operated"
 	defaultPortName           = "web"
 	defaultRetention          = "24h"
 	defaultEvaluationInterval = "15s"
 	defaultReplicaLabelName   = "thanos_ruler_replica"
-	sSetInputHashName         = "prometheus-operator-input-hash"
 )
 
 var (
 	minReplicas int32 = 1
 )
 
-func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapNames []string, inputHash string) (*appsv1.StatefulSet, error) {
+func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapNames []string, inputHash string, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSet, error) {
 
 	if tr.Spec.Resources.Requests == nil {
 		tr.Spec.Resources.Requests = v1.ResourceList{}
@@ -59,48 +61,39 @@ func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapN
 		tr.Spec.Resources.Requests[v1.ResourceMemory] = resource.MustParse("200Mi")
 	}
 
-	spec, err := makeStatefulSetSpec(tr, config, ruleConfigMapNames)
+	spec, err := makeStatefulSetSpec(tr, config, ruleConfigMapNames, tlsSecrets)
 	if err != nil {
 		return nil, err
 	}
 
-	annotations := map[string]string{
-		sSetInputHashName: inputHash,
-	}
-
-	// do not transfer kubectl annotations to the statefulset so it is not
-	// pruned by kubectl
-	for key, value := range tr.ObjectMeta.Annotations {
-		if key != sSetInputHashName && !strings.HasPrefix(key, "kubectl.kubernetes.io/") {
-			annotations[key] = value
-		}
-	}
-
 	statefulset := &appsv1.StatefulSet{Spec: *spec}
-
 	operator.UpdateObject(
 		statefulset,
 		operator.WithName(prefixedName(tr.Name)),
-		operator.WithAnnotations(annotations),
+		operator.WithInputHashAnnotation(inputHash),
+		operator.WithAnnotations(tr.GetAnnotations()),
 		operator.WithAnnotations(config.Annotations),
 		operator.WithLabels(tr.GetLabels()),
 		operator.WithLabels(config.Labels),
-		operator.WithOwner(tr),
+		operator.WithManagingOwner(tr),
+		operator.WithoutKubectlAnnotations(),
 	)
 
-	if tr.Spec.ImagePullSecrets != nil && len(tr.Spec.ImagePullSecrets) > 0 {
+	if len(tr.Spec.ImagePullSecrets) > 0 {
 		statefulset.Spec.Template.Spec.ImagePullSecrets = tr.Spec.ImagePullSecrets
 	}
 
 	storageSpec := tr.Spec.Storage
-	if storageSpec == nil {
+	switch {
+	case storageSpec == nil:
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(tr.Name),
 			VolumeSource: v1.VolumeSource{
 				EmptyDir: &v1.EmptyDirVolumeSource{},
 			},
 		})
-	} else if storageSpec.EmptyDir != nil {
+
+	case storageSpec.EmptyDir != nil:
 		emptyDir := storageSpec.EmptyDir
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(tr.Name),
@@ -108,7 +101,8 @@ func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapN
 				EmptyDir: emptyDir,
 			},
 		})
-	} else if storageSpec.Ephemeral != nil {
+
+	case storageSpec.Ephemeral != nil:
 		ephemeral := storageSpec.Ephemeral
 		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
 			Name: volumeName(tr.Name),
@@ -116,7 +110,8 @@ func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapN
 				Ephemeral: ephemeral,
 			},
 		})
-	} else {
+
+	default: // storageSpec.VolumeClaimTemplate
 		pvcTemplate := operator.MakeVolumeClaimTemplate(storageSpec.VolumeClaimTemplate)
 		if pvcTemplate.Name == "" {
 			pvcTemplate.Name = volumeName(tr.Name)
@@ -136,15 +131,16 @@ func makeStatefulSet(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapN
 	return statefulset, nil
 }
 
-func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapNames []string) (*appsv1.StatefulSetSpec, error) {
+func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfigMapNames []string, tlsSecrets *operator.ShardedSecret) (*appsv1.StatefulSetSpec, error) {
 	if tr.Spec.QueryConfig == nil && len(tr.Spec.QueryEndpoints) < 1 {
 		return nil, errors.New(tr.GetName() + ": thanos ruler requires query config or at least one query endpoint to be specified")
 	}
 
-	thanosVersion := operator.StringValOrDefault(tr.Spec.Version, operator.DefaultThanosVersion)
-	if _, err := semver.ParseTolerant(thanosVersion); err != nil {
-		return nil, fmt.Errorf("failed to parse Thanos version: %w", err)
+	thanosVersion := operator.StringValOrDefault(ptr.Deref(tr.Spec.Version, ""), operator.DefaultThanosVersion)
 
+	version, err := semver.ParseTolerant(thanosVersion)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse thanos ruler version: %w", err)
 	}
 
 	trImagePath, err := operator.BuildImagePath(
@@ -216,7 +212,8 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 	trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "rule-file", Value: rulePath})
 
 	if tr.Spec.QueryConfig != nil {
-		fullPath := mountSecret(tr.Spec.QueryConfig, "query-config", &trVolumes, &trVolumeMounts)
+		var fullPath string
+		trVolumes, trVolumeMounts, fullPath = mountSecretKey(trVolumes, trVolumeMounts, tr.Spec.QueryConfig, "query-config")
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "query.config-file", Value: fullPath})
 	} else if len(tr.Spec.QueryEndpoints) > 0 {
 		for _, endpoint := range tr.Spec.QueryEndpoints {
@@ -225,7 +222,8 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 	}
 
 	if tr.Spec.AlertManagersConfig != nil {
-		fullPath := mountSecret(tr.Spec.AlertManagersConfig, "alertmanager-config", &trVolumes, &trVolumeMounts)
+		var fullPath string
+		trVolumes, trVolumeMounts, fullPath = mountSecretKey(trVolumes, trVolumeMounts, tr.Spec.AlertManagersConfig, "alertmanager-config")
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "alertmanagers.config-file", Value: fullPath})
 	} else if len(tr.Spec.AlertManagersURL) > 0 {
 		for _, url := range tr.Spec.AlertManagersURL {
@@ -236,22 +234,39 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 	if tr.Spec.ObjectStorageConfigFile != nil {
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "objstore.config-file", Value: *tr.Spec.ObjectStorageConfigFile})
 	} else if tr.Spec.ObjectStorageConfig != nil {
-		fullPath := mountSecret(tr.Spec.ObjectStorageConfig, "objstorage-config", &trVolumes, &trVolumeMounts)
+		var fullPath string
+		trVolumes, trVolumeMounts, fullPath = mountSecretKey(trVolumes, trVolumeMounts, tr.Spec.ObjectStorageConfig, "objstorage-config")
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "objstore.config-file", Value: fullPath})
 	}
 
 	if tr.Spec.TracingConfigFile != "" {
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "tracing.config-file", Value: tr.Spec.TracingConfigFile})
 	} else if tr.Spec.TracingConfig != nil {
-		fullPath := mountSecret(tr.Spec.TracingConfig, "tracing-config", &trVolumes, &trVolumeMounts)
+		var fullPath string
+		trVolumes, trVolumeMounts, fullPath = mountSecretKey(trVolumes, trVolumeMounts, tr.Spec.TracingConfig, "tracing-config")
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "tracing.config-file", Value: fullPath})
 	}
 
 	if tr.Spec.AlertRelabelConfigFile != nil {
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "alert.relabel-config-file", Value: *tr.Spec.AlertRelabelConfigFile})
 	} else if tr.Spec.AlertRelabelConfigs != nil {
-		fullPath := mountSecret(tr.Spec.AlertRelabelConfigs, "alertrelabel-config", &trVolumes, &trVolumeMounts)
+		var fullPath string
+		trVolumes, trVolumeMounts, fullPath = mountSecretKey(trVolumes, trVolumeMounts, tr.Spec.AlertRelabelConfigs, "alertrelabel-config")
 		trCLIArgs = append(trCLIArgs, monitoringv1.Argument{Name: "alert.relabel-config-file", Value: fullPath})
+	}
+
+	trVolumes = append(trVolumes, tlsSecrets.Volume("tls-assets"))
+	trVolumeMounts = append(trVolumeMounts, v1.VolumeMount{
+		Name:      "tls-assets",
+		ReadOnly:  true,
+		MountPath: tlsAssetsDir,
+	})
+
+	isHTTPS := tr.Spec.Web != nil && tr.Spec.Web.TLSConfig != nil && version.GTE(semver.MustParse("0.21.0"))
+
+	thanosrulerURIScheme := "http"
+	if isHTTPS {
+		thanosrulerURIScheme = "https"
 	}
 
 	if tr.Spec.GRPCServerTLSConfig != nil {
@@ -287,6 +302,7 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 	// The first argument to thanos must be "rule" to start thanos ruler, e.g. "thanos rule --data-dir..."
 	containerArgs = append([]string{"rule"}, containerArgs...)
 
+	var configReloaderWebConfigFile string
 	var additionalContainers []v1.Container
 	if len(ruleConfigMapNames) != 0 {
 		var (
@@ -303,13 +319,37 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 			watchedDirectories = append(watchedDirectories, mountPath)
 		}
 
+		if version.GTE(semver.MustParse("0.21.0")) {
+			var fields monitoringv1.WebConfigFileFields
+			if tr.Spec.Web != nil {
+				fields = tr.Spec.Web.WebConfigFileFields
+			}
+
+			webConfig, err := webconfig.New(webConfigDir, webConfigSecretName(tr.Name), fields)
+			if err != nil {
+				return nil, err
+			}
+
+			confArg, configVol, configMount, err := webConfig.GetMountParameters()
+			if err != nil {
+				return nil, err
+			}
+			containerArgs = append(containerArgs, fmt.Sprintf("--http.config=%s", confArg.Value))
+			trVolumes = append(trVolumes, configVol...)
+			trVolumeMounts = append(trVolumeMounts, configMount...)
+
+			configReloaderWebConfigFile = confArg.Value
+			configReloaderVolumeMounts = append(configReloaderVolumeMounts, configMount...)
+		}
+
 		additionalContainers = append(
 			additionalContainers,
 			operator.CreateConfigReloader(
 				"config-reloader",
 				operator.ReloaderConfig(config.ReloaderConfig),
+				operator.WebConfigFile(configReloaderWebConfigFile),
 				operator.ReloaderURL(url.URL{
-					Scheme: "http",
+					Scheme: thanosrulerURIScheme,
 					Host:   config.LocalHost + ":10902",
 					Path:   path.Clean(tr.Spec.RoutePrefix + "/-/reload"),
 				}),
@@ -374,12 +414,7 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 		})
 	}
 
-	for _, thanosRulerVM := range tr.Spec.VolumeMounts {
-		trVolumeMounts = append(trVolumeMounts, v1.VolumeMount{
-			Name:      thanosRulerVM.Name,
-			MountPath: thanosRulerVM.MountPath,
-		})
-	}
+	trVolumeMounts = append(trVolumeMounts, tr.Spec.VolumeMounts...)
 
 	operatorContainers := append([]v1.Container{
 		{
@@ -412,12 +447,12 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 		minReadySeconds = int32(*tr.Spec.MinReadySeconds)
 	}
 
-	// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
-	// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
-	return &appsv1.StatefulSetSpec{
-		ServiceName:         governingServiceName,
-		Replicas:            tr.Spec.Replicas,
-		MinReadySeconds:     minReadySeconds,
+	spec := appsv1.StatefulSetSpec{
+		ServiceName:     governingServiceName,
+		Replicas:        tr.Spec.Replicas,
+		MinReadySeconds: minReadySeconds,
+		// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
+		// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
 		PodManagementPolicy: appsv1.ParallelPodManagement,
 		UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 			Type: appsv1.RollingUpdateStatefulSetStrategyType,
@@ -445,7 +480,12 @@ func makeStatefulSetSpec(tr *monitoringv1.ThanosRuler, config Config, ruleConfig
 				HostAliases:                   operator.MakeHostAliases(tr.Spec.HostAliases),
 			},
 		},
-	}, nil
+	}
+
+	k8sutil.UpdateDNSConfig(&spec.Template.Spec, tr.Spec.DNSConfig)
+	k8sutil.UpdateDNSPolicy(&spec.Template.Spec, tr.Spec.DNSPolicy)
+
+	return &spec, nil
 }
 
 func makeStatefulSetService(tr *monitoringv1.ThanosRuler, config Config) *v1.Service {
@@ -496,26 +536,36 @@ func volumeName(name string) string {
 	return fmt.Sprintf("%s-data", prefixedName(name))
 }
 
-func mountSecret(secretSelector *v1.SecretKeySelector, volumeName string, trVolumes *[]v1.Volume, trVolumeMounts *[]v1.VolumeMount) string {
-	path := secretSelector.Key
-	*trVolumes = append(*trVolumes, v1.Volume{
-		Name: volumeName,
-		VolumeSource: v1.VolumeSource{
-			Secret: &v1.SecretVolumeSource{
-				SecretName: secretSelector.Name,
-				Items: []v1.KeyToPath{
-					{
-						Key:  secretSelector.Key,
-						Path: path,
+func tlsAssetsSecretName(name string) string {
+	return fmt.Sprintf("%s-tls-assets", prefixedName(name))
+}
+
+func webConfigSecretName(name string) string {
+	return fmt.Sprintf("%s-web-config", prefixedName(name))
+}
+
+// mountSecretKey adds the secret key to the mounted volumes and returns the
+// full path of the file on disk.
+func mountSecretKey(vols []v1.Volume, vmounts []v1.VolumeMount, secretSelector *v1.SecretKeySelector, volumeName string) ([]v1.Volume, []v1.VolumeMount, string) {
+	mountpath := filepath.Join(configDir, volumeName)
+
+	return append(vols, v1.Volume{
+			Name: volumeName,
+			VolumeSource: v1.VolumeSource{
+				Secret: &v1.SecretVolumeSource{
+					SecretName: secretSelector.Name,
+					Items: []v1.KeyToPath{
+						{
+							Key:  secretSelector.Key,
+							Path: secretSelector.Key,
+						},
 					},
 				},
 			},
-		},
-	})
-	mountpath := configDir + "/" + volumeName
-	*trVolumeMounts = append(*trVolumeMounts, v1.VolumeMount{
-		Name:      volumeName,
-		MountPath: mountpath,
-	})
-	return mountpath + "/" + path
+		}),
+		append(vmounts, v1.VolumeMount{
+			Name:      volumeName,
+			MountPath: mountpath,
+		}),
+		filepath.Join(mountpath, secretSelector.Key)
 }

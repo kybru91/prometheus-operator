@@ -64,7 +64,7 @@ spec:
     spec:
       containers:
       - name: example-app
-        image: fabxc/instrumented_app:latest
+        image: quay.io/brancz/prometheus-example-app:v0.5.0
         ports:
         - name: web
           containerPort: 8080
@@ -117,7 +117,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: Prometheus
 metadata:
   labels:
-    prometheus: prometheus
+    prometheus: shards
   name: prometheus
   namespace: default
 spec:
